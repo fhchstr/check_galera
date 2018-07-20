@@ -1,0 +1,397 @@
+#!/usr/bin/env python
+#
+# Author:  Fabien Hochstrasser <fabien.hochstrasser@swisscom.com>
+# Date:    2018-03-20
+# Purpose: Nagios check to monitor the health of a Galera cluster node.
+#
+# It implements all the recommendations documented on the Galera Cluster website
+# as well as ideas discussed with the MariaDB support (ticket #18384).
+#
+# http://galeracluster.com/documentation-webpages/monitoringthecluster.html
+#
+# Some status variables (counters) are always growing, unless they are reset
+# using FLUSH STATUS. To be able to see a trend, the values read during the
+# previous execution of the script are saved in a file. To keept it simple, all
+# the values are written to this file, not only the ones which requires it.
+# The highest value ever seen is also stored in the file.
+#
+# This script only checks the status variables LOCALLY. It doesn't query the
+# other nodes to see if a value is the same on all nodes for example.
+#
+# require: mysql-connector-python (from the MySQL connector download page)
+#
+# Usage: see --help
+#
+import argparse
+import json
+import os
+import sys
+import tempfile
+
+from collections import namedtuple
+
+import mysql.connector
+
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
+
+Result = namedtuple('Result', 'name value expected severity')
+
+
+def main(current_status, previous_status, expected_cluster_size):
+    results = []
+    if expected_cluster_size:
+        results.extend(check_cluster_integrity(current_status, expected_cluster_size))
+    elif VERBOSE:
+        print('Cluster size not specified, not checking it')
+
+    results.extend(check_node_status(current_status))
+    results.extend(check_replication_health(current_status, previous_status))
+    results.extend(check_slow_network_issues(current_status, previous_status))
+
+    print_status(
+        results,
+        uuid=current_status['wsrep_cluster_state_uuid'],
+        conf_id=current_status['wsrep_cluster_conf_id'],
+    )
+
+    sys.exit((
+        CRITICAL if any([s.severity == CRITICAL for s in results])
+        else WARNING if any([s.severity == WARNING for s in results])
+        else OK
+    ))
+
+
+def check_cluster_integrity(status, expected_size):
+    """See chapter "Checking cluster integrity" on the documentation.
+
+    wsrep_cluster_state_uuid and wsrep_cluster_conf_id are NOT checked because
+    we would need to query the other Galera nodes to know if their value is OK.
+    """
+    return [
+        Result(
+            name='wsrep_cluster_size',
+            value=status['wsrep_cluster_size'],
+            expected=expected_size,
+            severity=(
+                OK if int(status['wsrep_cluster_size']) >= expected_size
+                else CRITICAL if int(status['wsrep_cluster_size']) == 1
+                else WARNING
+            ),
+        ),
+        Result(
+            name='wsrep_cluster_status',
+            value=status['wsrep_cluster_status'],
+            expected='Primary',
+            severity=OK if status['wsrep_cluster_status'] == 'Primary' else CRITICAL,
+        )
+    ]
+
+
+def check_node_status(status):
+    """See chapter "Checking the node status" on the documentation."""
+    return [
+        Result(
+            name='wsrep_ready',
+            value=status['wsrep_ready'],
+            expected='ON',
+            severity=OK if status['wsrep_ready'] == 'ON' else CRITICAL,
+        ),
+        Result(
+            name='wsrep_connected',
+            value=status['wsrep_connected'],
+            expected='ON',
+            severity=OK if status['wsrep_connected'] == 'ON' else CRITICAL,
+        ),
+        Result(
+            name='wsrep_local_state_comment',
+            value=status['wsrep_local_state_comment'],
+            expected='Synced',
+            severity=(
+                OK if status['wsrep_local_state_comment'] == 'Synced'
+                else CRITICAL if status['wsrep_local_state_comment'] == 'Initialized'
+                else WARNING
+            ),
+        ),
+    ]
+
+
+def check_replication_health(current_status, previous_status):
+    """See the chapter "Checking the replication health" on the documentation.
+
+    wsrep_cert_deps_distance is not checked because it isn't telling us anything
+    about the cluster health.
+    """
+    return [
+        wsrep_local_recv_queue(current_status, previous_status),
+        wsrep_flow_control_paused(current_status, previous_status),
+    ]
+
+
+def wsrep_local_recv_queue(current_status, previous_status):
+    """The value of the wsrep_local_recv_queue_* variables are reset on each query.
+
+    Here's what the MariaDB support said:
+    When wsrep_local_recv_queue_avg is > 1 (you were at least one writeset behind)
+    and is growing comparing to the previous value recorded, it's something to warn
+    about for sure. You can check if it approaches historical *_max value also.
+    """
+    current = float(current_status['wsrep_local_recv_queue_avg'])
+    if 'wsrep_local_recv_queue_avg' in previous_status:
+        previous = float(previous_status['wsrep_local_recv_queue_avg'])
+    else:
+        previous = 0
+
+    return Result(
+        name='wsrep_local_recv_queue_avg (since last query)',
+        value=current,
+        expected=0,
+        severity=WARNING if current > 1 and current > previous else OK,
+    )
+
+
+def wsrep_flow_control_paused(current_status, previous_status):
+    """The value of wsrep_flow_control_paused is reset on each FLUSH STATUS command.
+
+    Here's what the MariaDB support said:
+    Either you consider anything > 0 and growing a problem, or get time since flush status,
+    multiply and set threshold in seconds. But then without FLUSH it should be one time alert.
+    """
+    current = float(current_status['wsrep_flow_control_paused'])
+    if 'wsrep_flow_control_paused' in previous_status:
+        previous = float(previous_status['wsrep_flow_control_paused'])
+    else:
+        previous = 0
+
+    # When the FLUSH STATUS command is executed, the value is reset. So we just
+    # proceed without history. We might miss a problem here, but it'll be caught
+    # on the next run of the check if it persists.
+    diff = current - previous
+
+    return Result(
+        name='wsrep_flow_control_paused (since FLUSH STATUS)',
+        value=diff,
+        expected=0,
+        severity=WARNING if diff > 0 else OK,
+    )
+
+
+def check_slow_network_issues(current_status, previous_status):
+    """See the chapter "Detecting slow network issues" on the documentation."""
+    return [
+        wsrep_local_send_queue(current_status, previous_status),
+    ]
+
+
+def wsrep_local_send_queue(current_status, previous_status):
+    """The value of the wsrep_local_send_queue_* variables is reset on each FLUSH STATUS command.
+
+    Here's what the MariaDB support said:
+    Anything above 1 and growing is surely a problem.
+    """
+    current = float(current_status['wsrep_local_send_queue_avg'])
+    if 'wsrep_local_send_queue_avg' in previous_status:
+        previous = float(previous_status['wsrep_local_send_queue_avg'])
+    else:
+        previous = 0
+
+    # When the FLUSH STATUS command is executed, the value is reset. So we just
+    # proceed without history. We might miss a problem here, but it'll be caught
+    # on the next run of the check if it persists.
+    diff = current - previous
+
+    return Result(
+        name='wsrep_local_send_queue_avg (since FLUSH STATUS)',
+        value=diff,
+        expected=0,
+        severity=WARNING if current > 1 and diff > 0 else OK,
+    )
+
+
+def print_status(results, uuid, conf_id):
+    """Display the cluster status in a human friendly format."""
+    if VERBOSE:
+        for result in results:
+            # Some names contain a comment, here we extract the real variable name
+            name = result.name.split(' ')[0].strip()
+
+            text = '{r.name}={r.value} [expected={r.expected}'.format(r=result)
+            if not isinstance(result.value, basestring):
+                text += ', previous={previous}, max={max}'.format(
+                    previous=previous_status[name],
+                    max=previous_status.max(name),
+                )
+            text += ']'
+            print(text)
+
+    problems = []
+    for result in results:
+        if result.severity != OK:
+            problems.append('{r.name}={r.value} (should be {r.expected})'.format(r=result))
+
+    print('{severity} - {problems}{always_displayed}'.format(
+        severity=(
+            'CRITICAL' if any([s.severity == CRITICAL for s in results])
+            else 'WARNING' if any([s.severity == WARNING for s in results])
+            else 'OK'
+        ),
+        problems='{0} - '.format(', '.join(problems)) if problems else '',
+        always_displayed='uuid={uuid}, conf_id={conf_id}'.format(
+            uuid=uuid,
+            conf_id=conf_id,
+        ),
+    ))
+
+
+class StatusWSREP(object):
+    """This class is used to store the WSREP status variables.
+
+    It can be written to/read from a file.
+    The values are exposed in a pythonic way. It's possible to get the maximum
+    value ever seen for any status variable using the max() method.
+
+    After the class is instanciated, the status must be set using
+    instance[key] = value for each status variable.
+    """
+
+    @classmethod
+    def from_file(cls, filename):
+        """Factory to instanciate a class from a file."""
+        statusWSREP = cls()
+
+        try:
+            with open(filename, 'r') as f:
+                statusWSREP.status = json.load(f)
+        except:
+            # Just return an "empty" instance if the file cannot be read
+            pass
+
+        return statusWSREP
+
+    def __init__(self):
+        self.status = {}
+
+    def write_to_file(self, filename):
+        with open(filename, 'w') as f:
+            json.dump(self.status, f)
+
+    def __setitem__(self, key, value):
+        if key not in self.status:
+            self.status[key] = {'current': None, 'max': None}
+
+        self.status[key]['current'] = value
+
+        if value > self.status[key]['max']:
+            self.status[key]['max'] = value
+
+    def __getitem__(self, key):
+        if key in self.status:
+            return self.status[key]['current']
+        return None
+
+    def __contains__(self, item):
+        return item in self.status
+
+    def max(self, key):
+        if key in self.status:
+            return self.status[key]['max']
+        return None
+
+    def __repr__(self):
+        return self.status.__repr__()
+
+
+DatabaseInfo = namedtuple('DatabaseInfo', 'host port username password')
+
+
+def read_wsrep_status(db_info):
+    cursor = None
+    connection = None
+    try:
+        connection = mysql.connector.connect(
+            host=db_info.host,
+            port=db_info.port,
+            user=db_info.username,
+            password=db_info.password,
+        )
+        cursor = connection.cursor()
+
+        cursor.execute('SHOW GLOBAL STATUS LIKE "wsrep_%"')
+        statusWSREP = StatusWSREP()
+        for key, value in cursor:
+            statusWSREP[key] = value
+        return statusWSREP
+    except mysql.connector.errors.InterfaceError as e:
+        print(e)
+        sys.exit(CRITICAL)
+    except mysql.connector.errors.ProgrammingError as e:
+        print(e)
+        sys.exit(UNKNOWN)
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+
+DEFAULT_USER = 'root'
+DEFAULT_HOST = '127.0.0.1'
+DEFAULT_PORT = 3306
+
+HISTORY_FILE = os.path.join(tempfile.gettempdir(), os.path.basename(__file__) + '.last_run')
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Nagios check to monitor the health of a Galera cluster.',
+    )
+    parser.add_argument(
+        '--user', '-u',
+        type=str,
+        default=DEFAULT_USER,
+        help='MySQL user used to read the cluster status. Default: {0}'.format(DEFAULT_USER),
+    )
+    parser.add_argument(
+        '--password', '-p',
+        type=str,
+        help='Password of the MySQL user',
+    )
+    parser.add_argument(
+        '--host',
+        type=str,
+        default=DEFAULT_HOST,
+        help='Host to monitor. Default: {0}'.format(DEFAULT_HOST),
+    )
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=DEFAULT_PORT,
+        help='TCP port used for the connection. Default: {0}'.format(DEFAULT_PORT),
+    )
+    parser.add_argument(
+        '--expected-size', '-e',
+        type=int,
+        help='Alert if the cluster size is smaller than this value.',
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Show verbose output',
+    )
+    args = parser.parse_args()
+
+    VERBOSE = args.verbose
+
+    previous_status = StatusWSREP.from_file(HISTORY_FILE)
+    current_status = read_wsrep_status(
+        DatabaseInfo(
+            username=args.user,
+            password=args.password,
+            host=args.host,
+            port=args.port,
+        )
+    )
+    current_status.write_to_file(HISTORY_FILE)
+
+    main(current_status, previous_status, args.expected_size)
